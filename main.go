@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -183,16 +184,32 @@ func duBytes(ctx context.Context, path string, timeout time.Duration) (int64, er
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, "du", "-sk", path)
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return 0, fmt.Errorf("du exited %d: %s", ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	// `du` walks the tree concurrently with whatever the watched application
+	// is doing, so files frequently disappear mid-scan. We treat those ENOENT
+	// lines as benign (du still prints a running total) but surface anything
+	// else (Permission denied, I/O errors, ...) as a real failure.
+	var fatal []string
+	for _, line := range strings.Split(strings.TrimRight(stderr.String(), "\n"), "\n") {
+		if line == "" || strings.HasSuffix(line, ": No such file or directory") {
+			continue
 		}
-		return 0, err
+		fatal = append(fatal, line)
 	}
-	fields := strings.Fields(string(out))
+	if len(fatal) > 0 {
+		return 0, fmt.Errorf("du: %s", strings.Join(fatal, "; "))
+	}
+
+	fields := strings.Fields(stdout.String())
 	if len(fields) < 1 {
-		return 0, fmt.Errorf("unexpected du output: %q", string(out))
+		if runErr != nil {
+			return 0, fmt.Errorf("du failed with no output: %w", runErr)
+		}
+		return 0, fmt.Errorf("unexpected du output: %q", stdout.String())
 	}
 	kb, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil {
